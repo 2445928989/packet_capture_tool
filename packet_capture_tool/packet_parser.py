@@ -1,4 +1,4 @@
-"""Packet parsing helpers used by the GUI application."""
+"""GUI 应用程序使用的数据包解析辅助函数。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -161,14 +161,14 @@ def _populate_transport_layer(packet: object) -> (Dict[str, str], List[str], Dic
 
 
 def parse_packet(packet: object) -> ParsedPacket:
-    """Convert a scapy packet into a :class:`ParsedPacket` structure."""
+    """将 scapy 数据包转换为 :class:`ParsedPacket` 结构。"""
     timestamp = datetime.now()
     summary = getattr(packet, "summary", lambda: repr(packet))()
 
     network_layer, network_protocols = _populate_network_layer(packet)
     transport_layer, transport_protocols, dns_info = _populate_transport_layer(packet)
 
-    protocols = list(dict.fromkeys(network_protocols + transport_protocols))  # preserve order
+    protocols = list(dict.fromkeys(network_protocols + transport_protocols))  # 保持顺序
     if dns_info:
         protocols.append("DNS")
 

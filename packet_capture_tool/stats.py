@@ -1,4 +1,4 @@
-"""Traffic statistics helpers."""
+"""流量统计辅助函数。"""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -9,7 +9,7 @@ from .packet_parser import ParsedPacket
 
 
 class TrafficStats:
-    """Aggregates per-protocol counters and IPv6 ratio timeline."""
+    """聚合每个协议的计数器和 IPv6 占比时间线。"""
 
     def __init__(self, window: timedelta = timedelta(days=1)) -> None:
         self.window = window
@@ -29,7 +29,7 @@ class TrafficStats:
         if "DNS" in packet.protocols:
             self._protocol_counts["DNS"] -= 1
 
-        # Add specific counting for IPv4 and IPv6
+        # 为 IPv4 和 IPv6 添加特定计数
         if "IPv4" in packet.network_layer.get("version", ""):
             self._protocol_counts["IPv4"] += 1
         elif "IPv6" in packet.network_layer.get("version", ""):
@@ -52,7 +52,7 @@ class TrafficStats:
             self._timeline.popleft()
 
     def ipv6_ratio_series(self) -> List[Tuple[datetime, float]]:
-        """Return a list of (timestamp, ratio) tuples for plotting."""
+        """返回用于绘图的 (时间戳, 占比) 元组列表。"""
         self._trim()
         series: List[Tuple[datetime, float]] = []
         total_packets = 0

@@ -1,4 +1,4 @@
-"""Utilities for persisting captured packets."""
+"""用于持久化捕获数据包的实用工具。"""
 from __future__ import annotations
 
 import json

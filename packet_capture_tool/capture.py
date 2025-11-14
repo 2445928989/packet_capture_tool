@@ -1,4 +1,4 @@
-"""Capture management utilities for the packet capture tool."""
+"""数据包捕获工具的管理工具。"""
 from __future__ import annotations
 
 import logging
@@ -13,11 +13,11 @@ except Exception:  # pragma: no cover - scapy may be unavailable in CI environme
 
 
 class CaptureUnavailableError(RuntimeError):
-    """Raised when packet capture is requested but scapy/tshark is unavailable."""
+    """当请求数据包捕获但 scapy/tshark 不可用时抛出。"""
 
 
 class CaptureManager:
-    """Wraps :class:`scapy.all.AsyncSniffer` for safe start/stop management."""
+    """封装 :class:`scapy.all.AsyncSniffer` 以实现安全的启动/停止管理。"""
 
     def __init__(self, packet_callback: Callable[[object], None]):
         self._packet_callback = packet_callback # 回调
@@ -36,11 +36,11 @@ class CaptureManager:
     def start(self, filter_expr: Optional[str] = None, iface: Optional[str] = None, promisc: bool = True) -> None:
         if not self.is_available():
             raise CaptureUnavailableError(
-                "Scapy is not available. Install scapy and ensure necessary permissions are granted."
+                "Scapy 不可用。请安装 scapy 并确保已授予必要的权限。"
             )
 
         if self.is_running:
-            logging.info("Capture already running")
+            logging.info("捕获已在运行")
             return
 
         self._filter_expr = filter_expr
@@ -50,7 +50,7 @@ class CaptureManager:
             try:
                 self._packet_callback(packet)
             except Exception:  # pragma: no cover - defensive logging
-                logging.exception("Failed to process captured packet")
+                logging.exception("处理捕获的数据包失败")
 
         self._sniffer = AsyncSniffer(
             filter=filter_expr,
@@ -60,7 +60,7 @@ class CaptureManager:
             promisc=promisc,
         )
         self._sniffer.start()
-        logging.info("Packet capture started with filter=%s iface=%s", filter_expr, iface)
+        logging.info("数据包捕获已启动，过滤器=%s 接口=%s", filter_expr, iface)
 
     def stop(self) -> None:
         if self._sniffer is not None:

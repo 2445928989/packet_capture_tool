@@ -1,4 +1,4 @@
-"""Background resource monitoring for the GUI."""
+"""GUI 的后台资源监控。"""
 from __future__ import annotations
 
 import threading
@@ -20,7 +20,7 @@ class ResourceSample:
 
 
 class ResourceMonitor:
-    """Polls CPU and memory usage on an interval and emits :class:`ResourceSample`."""
+    """按间隔轮询 CPU 和内存使用情况，并发出 :class:`ResourceSample`。"""
 
     def __init__(self, callback: Callable[[ResourceSample], None], interval: float = 1.0) -> None:
         self.callback = callback

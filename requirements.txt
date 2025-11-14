@@ -1,3 +1,4 @@
 matplotlib>=3.7
 psutil>=5.9
 scapy>=2.5
+customtkinter>=5.2.0
