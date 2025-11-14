@@ -26,6 +26,14 @@ class TrafficStats:
         self.total_packets += 1
         for protocol in packet.protocols:
             self._protocol_counts[protocol.upper()] += 1
+        if "DNS" in packet.protocols:
+            self._protocol_counts["DNS"] -= 1
+
+        # Add specific counting for IPv4 and IPv6
+        if "IPv4" in packet.network_layer.get("version", ""):
+            self._protocol_counts["IPv4"] += 1
+        elif "IPv6" in packet.network_layer.get("version", ""):
+            self._protocol_counts["IPv6"] += 1
 
         timestamp = packet.timestamp.replace(second=0, microsecond=0)
         ipv6_present = 1 if packet.network_layer.get("version") == "IPv6" else 0
