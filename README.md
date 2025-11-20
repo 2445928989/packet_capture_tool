@@ -1,4 +1,4 @@
-# 网络数据包捕获与分析工具
+# NekoShark 🐱🦈
 
 基于 PyQt6 开发的现代化网络流量分析工具，提供实时数据包捕获、深度解析、灵活过滤和可视化统计功能。
 
@@ -222,7 +222,7 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which python3)
 
 ## 📝 开发说明
 
-本项目使用 PyQt6 构建，所有核心功能都在 `packet_capture_tool/` 目录下。修改代码后直接运行 `run.py` 即可看到效果。
+本项目使用 PyQt6 构建，所有核心功能都在 `src/` 目录下。修改代码后直接运行 `run.py` 即可看到效果。
 
 ## 📄 许可证
 

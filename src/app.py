@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -52,7 +52,7 @@ class SettingsDialog(QDialog):
         self.resize(500, 400)
         
         # 加载设置
-        self.settings = QSettings("PacketCaptureTool", "Settings")
+        self.settings = QSettings("NekoShark", "Settings")
         
         layout = QVBoxLayout(self)
         
@@ -200,11 +200,29 @@ class PacketCaptureApp(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("数据包捕获与分析工具")
+        self.setWindowTitle("NekoShark")
         self.resize(1400, 900)
+        
+        # 设置窗口图标（兼容开发环境和打包后的 exe）
+        import sys
+        import os
+        
+        def get_resource_path(relative_path):
+            """获取资源文件的绝对路径，兼容开发环境和打包后的exe"""
+            if getattr(sys, 'frozen', False):
+                # 打包后的exe，PyInstaller会解压到临时目录
+                base_path = sys._MEIPASS
+            else:
+                # 开发环境
+                base_path = Path(__file__).parent.parent
+            return os.path.join(base_path, relative_path)
+        
+        icon_path = get_resource_path("icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         # 加载设置
-        self.settings = QSettings("PacketCaptureTool", "Settings")
+        self.settings = QSettings("NekoShark", "Settings")
         self._auto_scroll_enabled = self.settings.value("auto_scroll", True, type=bool)
         self._auto_page_enabled = self.settings.value("auto_page", True, type=bool)
         self._batch_size_setting = self.settings.value("batch_size", 100, type=int)
@@ -369,6 +387,10 @@ class PacketCaptureApp(QMainWindow):
         settings_button.clicked.connect(self.open_settings)
         button_layout.addWidget(settings_button)
         
+        about_button = QPushButton("ℹ️ 关于")
+        about_button.clicked.connect(self.show_about)
+        button_layout.addWidget(about_button)
+        
         # 网络状态指示器
         self.network_status_label = QLabel("● 未开始")
         self.network_status_label.setStyleSheet("""
@@ -389,10 +411,27 @@ class PacketCaptureApp(QMainWindow):
 
         # 主分割器
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #555;
+                width: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #777;
+            }
+        """)
         
         # 左侧：数据包列表
         left_widget = QWidget()
+        left_widget.setStyleSheet("""
+            QWidget {
+                border: 1px solid #444;
+                border-radius: 4px;
+                background-color: palette(window);
+            }
+        """)
         left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(8, 8, 8, 8)
         
         left_layout.addWidget(QLabel("📦 捕获的数据包"))
         
@@ -424,15 +463,18 @@ class PacketCaptureApp(QMainWindow):
         self.page_size_input.setMaximumWidth(60)
         pagination_layout.addWidget(self.page_size_input)
         
-        self.prev_button = QPushButton("◀")
+        self.prev_button = QPushButton("◀ 上一页")
+        self.prev_button.setMinimumWidth(80)
         self.prev_button.clicked.connect(self._on_prev_page)
         pagination_layout.addWidget(self.prev_button)
         
-        self.load_page_button = QPushButton("加载页面")
+        self.load_page_button = QPushButton("🔄 回到最新")
+        self.load_page_button.setMinimumWidth(100)
         self.load_page_button.clicked.connect(self._on_load_page)
         pagination_layout.addWidget(self.load_page_button)
         
-        self.next_button = QPushButton("▶")
+        self.next_button = QPushButton("下一页 ▶")
+        self.next_button.setMinimumWidth(80)
         self.next_button.clicked.connect(self._on_next_page)
         pagination_layout.addWidget(self.next_button)
         
@@ -444,6 +486,29 @@ class PacketCaptureApp(QMainWindow):
         
         # 右侧：标签页
         self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #444;
+                border-radius: 4px;
+                background-color: palette(window);
+                padding: 4px;
+            }
+            QTabBar::tab {
+                background-color: #353535;
+                color: white;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: #505050;
+                border-bottom: 2px solid #4a9eff;
+            }
+            QTabBar::tab:hover {
+                background-color: #454545;
+            }
+        """)
         
         # 详情标签页
         self.details_tree = QTreeWidget()
@@ -530,6 +595,44 @@ class PacketCaptureApp(QMainWindow):
             self._apply_theme(new_settings["theme"])
             
             QMessageBox.information(self, "设置已保存", "设置已成功保存并应用！")
+    
+    def show_about(self):
+        """显示关于对话框"""
+        about_text = """
+        <div style='text-align: center;'>
+            <h2>🐱🦈 NekoShark</h2>
+            <p style='font-size: 14px; color: #666;'>🐱🦈 A network packet capture and analysis tool inspired by Wireshark</p>
+            <hr style='border: 1px solid #ddd; margin: 15px 0;'>
+            
+            <p><b>版本:</b> 1.0.0</p>
+            
+            <p><b>制作人:</b>2组 Dual-Core：蔡兆元 王思哲</p>
+            
+            <p><b>项目主页:</b><br>
+            <a href='https://github.com/2445928989/NekoShark'>
+            https://github.com/2445928989/NekoShark
+            </a></p>
+            
+            <hr style='border: 1px solid #ddd; margin: 15px 0;'>
+            
+            <p style='font-size: 12px; color: #888;'>
+            基于 PyQt6 + Scapy + Matplotlib 构建<br>
+            开源协议: MIT License
+            </p>
+            
+            <p style='font-size: 11px; color: #aaa; margin-top: 10px;'>
+            © 2024 NekoShark - All rights reserved
+            </p>
+        </div>
+        """
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("关于 NekoShark")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(about_text)
+        msg.setIconPixmap(self.windowIcon().pixmap(64, 64))
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
 
     def _on_display_filter_changed(self, text: str):
         """显示过滤器文本变化"""
