@@ -1,6 +1,11 @@
-# NekoShark 🐱🦈
+<div align="center">
+  <img src="icon.ico" alt="NekoShark Logo" width="200"/>
+  <h1>NekoShark 🐱🦈</h1>
+  <p>基于 PyQt6 开发的现代化网络流量分析工具</p>
+  <p>提供实时数据包捕获、深度解析、灵活过滤和可视化统计功能</p>
+</div>
 
-基于 PyQt6 开发的现代化网络流量分析工具，提供实时数据包捕获、深度解析、灵活过滤和可视化统计功能。
+---
 
 ## ✨ 核心功能
 
