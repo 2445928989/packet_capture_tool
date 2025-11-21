@@ -13,8 +13,10 @@ try:
     # Scapy 在 requirements 中已声明；导出 PCAP 依赖 scapy
     from scapy.all import Ether, IP, IPv6, TCP, UDP, Raw, wrpcap  # type: ignore
     from scapy.utils import PcapWriter  # type: ignore
+    from scapy.utils import PcapReader  # type: ignore
 except Exception:  # pragma: no cover - scapy may be missing in some envs
     Ether = IP = IPv6 = TCP = UDP = Raw = wrpcap = PcapWriter = None  # type: ignore
+    PcapReader = None  # type: ignore
 
 
 # 默认最大文件大小（字节）：50MB
@@ -406,4 +408,38 @@ def export_to_pcap(path: Path, packets: Iterable[ParsedPacket]) -> None:
     except Exception as e:
         logging.error(f"写入 PCAP 失败: {e}")
         raise
+
+
+def import_from_pcap(path: Path, extract_raw: bool = True) -> List[ParsedPacket]:
+    """从 PCAP 文件导入数据包并返回 ParsedPacket 列表。
+
+    Args:
+        path: PCAP 文件路径
+        extract_raw: 是否在返回的 ParsedPacket 中保留原始 bytes (base64)
+
+    Returns:
+        ParsedPacket 列表
+    """
+    if PcapReader is None:
+        raise RuntimeError("Scapy 未安装，无法导入 PCAP。请安装 scapy>=2.5")
+
+    results: List[ParsedPacket] = []
+    try:
+        # PcapReader 按流读取，避免一次性加载大量数据
+        with PcapReader(str(path)) as reader:
+            for pkt in reader:
+                try:
+                    # parse_packet 会尝试从 scapy packet 中读取时间戳与原始 bytes
+                    from .packet_parser import parse_packet
+
+                    parsed = parse_packet(pkt, extract_raw=extract_raw)
+                    results.append(parsed)
+                except Exception:
+                    logging.exception("解析 pcap 中的单个包失败，跳过")
+                    continue
+    except Exception as e:
+        logging.error(f"读取 PCAP 失败: {e}")
+        raise
+
+    return results
 
