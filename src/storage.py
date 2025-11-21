@@ -6,8 +6,15 @@ import logging
 import os
 from pathlib import Path
 from typing import Iterable, List, Optional, TextIO
+import base64
 
 from .packet_parser import ParsedPacket
+try:
+    # Scapy 在 requirements 中已声明；导出 PCAP 依赖 scapy
+    from scapy.all import Ether, IP, IPv6, TCP, UDP, Raw, wrpcap  # type: ignore
+    from scapy.utils import PcapWriter  # type: ignore
+except Exception:  # pragma: no cover - scapy may be missing in some envs
+    Ether = IP = IPv6 = TCP = UDP = Raw = wrpcap = PcapWriter = None  # type: ignore
 
 
 # 默认最大文件大小（字节）：50MB
@@ -161,4 +168,242 @@ def load_packets(path: Path) -> List[ParsedPacket]:
     """从单个 JSON 文件加载数据包（用于导入功能）"""
     data = json.loads(path.read_text(encoding="utf-8"))
     return [ParsedPacket.from_json(item) for item in data]
+
+
+def export_to_pcap(path: Path, packets: Iterable[ParsedPacket]) -> None:
+    """将给定的 ParsedPacket 列表导出为 PCAP 文件（基于字段重建 Scapy 包）。
+
+    说明：此方法采用轻量方案（方案 A），通过 ParsedPacket 中的
+    `network_layer`/`transport_layer` 字段重建最小的 Scapy 包并写入 pcap。
+    该方式无法恢复捕获时的原始裸字节（payload/选项/时间戳等可能丢失），
+    但足以用于课程演示与 Wireshark 打开查看协议字段。
+    """
+    if wrpcap is None:
+        raise RuntimeError("Scapy 未安装，无法导出 PCAP。请安装 scapy>=2.5")
+
+    # 如果 packets 中包含原始 bytes（raw_b64），优先使用原始字节和时间戳写入
+    raw_entries_exist = any(getattr(pkt, "raw_b64", None) for pkt in packets)
+
+    if raw_entries_exist:
+        if PcapWriter is None:
+            raise RuntimeError("Scapy 未安装，无法导出 PCAP（需要写入原始字节）。请安装 scapy>=2.5")
+        try:
+            writer = PcapWriter(str(path), append=False, sync=True)
+        except Exception as e:
+            logging.error(f"创建 PcapWriter 失败: {e}")
+            raise
+
+        for pkt in packets:
+            try:
+                raw_b64 = getattr(pkt, "raw_b64", None)
+                if raw_b64:
+                    raw_bytes = base64.b64decode(raw_b64)
+                    # 尝试用 Ether 解析原始字节为 Scapy Packet
+                    try:
+                        scapy_pkt = Ether(raw_bytes)
+                    except Exception:
+                        # 无法解析为以太网帧，则写入原始负载为 Raw
+                        scapy_pkt = Raw(raw_bytes)
+
+                    # 使用原始时间戳（若存在）
+                    ts = getattr(pkt, "orig_ts", None)
+                    if ts:
+                        writer.write(scapy_pkt, ts=float(ts))
+                    else:
+                        writer.write(scapy_pkt)
+                else:
+                    # 回退到字段重建（兼容旧数据）
+                    # 构建最小 scapy 包（复用下方重建逻辑）
+                    net = pkt.network_layer
+                    trans = pkt.transport_layer
+                    sc = None
+                    if net and isinstance(net, dict) and net.get("src_mac") and net.get("dst_mac"):
+                        try:
+                            sc = Ether(src=net.get("src_mac"), dst=net.get("dst_mac"))
+                        except Exception:
+                            sc = Ether()
+
+                    ip_layer = None
+                    if net and net.get("version") == "IPv4":
+                        try:
+                            ip_kwargs = {}
+                            if net.get("src"):
+                                ip_kwargs["src"] = net.get("src")
+                            if net.get("dst"):
+                                ip_kwargs["dst"] = net.get("dst")
+                            ip_layer = IP(**ip_kwargs)
+                        except Exception:
+                            ip_layer = IP()
+                    elif net and net.get("version") == "IPv6":
+                        try:
+                            ipv6_kwargs = {}
+                            if net.get("src"):
+                                ipv6_kwargs["src"] = net.get("src")
+                            if net.get("dst"):
+                                ipv6_kwargs["dst"] = net.get("dst")
+                            ip_layer = IPv6(**ipv6_kwargs)
+                        except Exception:
+                            ip_layer = IPv6()
+
+                    trans_layer = None
+                    if trans and trans.get("type") == "TCP":
+                        try:
+                            tcp_kwargs = {}
+                            if trans.get("sport"):
+                                tcp_kwargs["sport"] = int(trans.get("sport"))
+                            if trans.get("dport"):
+                                tcp_kwargs["dport"] = int(trans.get("dport"))
+                            trans_layer = TCP(**tcp_kwargs)
+                        except Exception:
+                            trans_layer = TCP()
+                    elif trans and trans.get("type") == "UDP":
+                        try:
+                            udp_kwargs = {}
+                            if trans.get("sport"):
+                                udp_kwargs["sport"] = int(trans.get("sport"))
+                            if trans.get("dport"):
+                                udp_kwargs["dport"] = int(trans.get("dport"))
+                            trans_layer = UDP(**udp_kwargs)
+                        except Exception:
+                            trans_layer = UDP()
+
+                    composed = None
+                    if sc is not None:
+                        composed = sc
+                        if ip_layer is not None:
+                            composed = composed / ip_layer
+                    else:
+                        if ip_layer is not None:
+                            composed = ip_layer
+                    if composed is None:
+                        composed = Raw(b"")
+                    if trans_layer is not None:
+                        composed = composed / trans_layer
+
+                    writer.write(composed)
+            except Exception:
+                logging.exception("写入 PcapWriter 时失败，跳过此包")
+                continue
+
+        # 关闭 writer
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return
+
+    # 否则回退到字段重建并一次性写入（原先逻辑）
+    scapy_pkts = []
+    for pkt in packets:
+        try:
+            net = pkt.network_layer
+            trans = pkt.transport_layer
+
+            sc = None
+            # 以太网层
+            if net and isinstance(net, dict) and net.get("src_mac") and net.get("dst_mac"):
+                try:
+                    eth_type = None
+                    if "type" in net:
+                        try:
+                            eth_type = int(net.get("type"), 16)
+                        except Exception:
+                            eth_type = None
+                    sc = Ether(src=net.get("src_mac"), dst=net.get("dst_mac"))
+                    if eth_type is not None:
+                        sc.type = eth_type
+                except Exception:
+                    sc = Ether()
+
+            # 网络层
+            ip_layer = None
+            if net and net.get("version") == "IPv4":
+                try:
+                    ip_kwargs = {}
+                    if net.get("src"):
+                        ip_kwargs["src"] = net.get("src")
+                    if net.get("dst"):
+                        ip_kwargs["dst"] = net.get("dst")
+                    if net.get("ttl"):
+                        try:
+                            ip_kwargs["ttl"] = int(net.get("ttl"))
+                        except Exception:
+                            pass
+                    ip_layer = IP(**ip_kwargs)
+                except Exception:
+                    ip_layer = IP()
+            elif net and net.get("version") == "IPv6":
+                try:
+                    ipv6_kwargs = {}
+                    if net.get("src"):
+                        ipv6_kwargs["src"] = net.get("src")
+                    if net.get("dst"):
+                        ipv6_kwargs["dst"] = net.get("dst")
+                    ip_layer = IPv6(**ipv6_kwargs)
+                except Exception:
+                    ip_layer = IPv6()
+
+            # 传输层
+            trans_layer = None
+            if trans and trans.get("type") == "TCP":
+                try:
+                    tcp_kwargs = {}
+                    if trans.get("sport"):
+                        tcp_kwargs["sport"] = int(trans.get("sport"))
+                    if trans.get("dport"):
+                        tcp_kwargs["dport"] = int(trans.get("dport"))
+                    if trans.get("seq"):
+                        try:
+                            tcp_kwargs["seq"] = int(trans.get("seq"))
+                        except Exception:
+                            pass
+                    if trans.get("ack"):
+                        try:
+                            tcp_kwargs["ack"] = int(trans.get("ack"))
+                        except Exception:
+                            pass
+                    if trans.get("flags"):
+                        tcp_kwargs["flags"] = str(trans.get("flags"))
+                    trans_layer = TCP(**tcp_kwargs)
+                except Exception:
+                    trans_layer = TCP()
+            elif trans and trans.get("type") == "UDP":
+                try:
+                    udp_kwargs = {}
+                    if trans.get("sport"):
+                        udp_kwargs["sport"] = int(trans.get("sport"))
+                    if trans.get("dport"):
+                        udp_kwargs["dport"] = int(trans.get("dport"))
+                    trans_layer = UDP(**udp_kwargs)
+                except Exception:
+                    trans_layer = UDP()
+
+            # 组合层次
+            composed = None
+            if sc is not None:
+                composed = sc
+                if ip_layer is not None:
+                    composed = composed / ip_layer
+            else:
+                if ip_layer is not None:
+                    composed = ip_layer
+
+            if composed is None:
+                # 无法构建分层，写入空的 Raw 包
+                composed = Raw(b"")
+
+            if trans_layer is not None:
+                composed = composed / trans_layer
+
+            scapy_pkts.append(composed)
+        except Exception:
+            logging.exception("重建 Scapy 包失败，跳过此包")
+            continue
+
+    # 使用 wrpcap 写 pcap（会覆盖同名文件）
+    try:
+        wrpcap(str(path), scapy_pkts)
+    except Exception as e:
+        logging.error(f"写入 PCAP 失败: {e}")
+        raise
 

@@ -119,6 +119,20 @@ class SettingsDialog(QDialog):
         
         cache_group.setLayout(cache_layout)
         layout.addWidget(cache_group)
+
+        # 保存选项
+        save_group = QGroupBox("保存选项")
+        save_layout = QVBoxLayout()
+
+        self.save_raw_checkbox = QCheckBox("保存原始包字节（raw bytes，增大文件大小）")
+        self.save_raw_checkbox.setChecked(self.settings.value("save_raw_packets", False, type=bool))
+        save_help = QLabel("开启后会在 JSON/JSONL 中保存 base64 编码的原始包，用于精确导出 PCAP。")
+        save_help.setStyleSheet("color: gray; font-size: 11px;")
+        save_layout.addWidget(self.save_raw_checkbox)
+        save_layout.addWidget(save_help)
+
+        save_group.setLayout(save_layout)
+        layout.addWidget(save_group)
         
         # 主题设置
         theme_group = QGroupBox("界面主题")
@@ -167,6 +181,7 @@ class SettingsDialog(QDialog):
         self.batch_size_spinbox.setValue(100)
         self.cache_size_spinbox.setValue(5000)
         self.dark_theme_radio.setChecked(True)
+        self.save_raw_checkbox.setChecked(False)
     
     def save_settings(self):
         """保存设置"""
@@ -176,6 +191,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("cache_size", self.cache_size_spinbox.value())
         theme = "dark" if self.dark_theme_radio.isChecked() else "light"
         self.settings.setValue("theme", theme)
+        self.settings.setValue("save_raw_packets", self.save_raw_checkbox.isChecked())
     
     def get_settings(self):
         """获取设置"""
@@ -186,6 +202,7 @@ class SettingsDialog(QDialog):
             "batch_size": self.batch_size_spinbox.value(),
             "cache_size": self.cache_size_spinbox.value(),
             "theme": theme
+            ,"save_raw_packets": self.save_raw_checkbox.isChecked()
         }
 
 
@@ -227,6 +244,7 @@ class PacketCaptureApp(QMainWindow):
         self._auto_page_enabled = self.settings.value("auto_page", True, type=bool)
         self._batch_size_setting = self.settings.value("batch_size", 100, type=int)
         self._ui_cache_size = self.settings.value("cache_size", 5000, type=int)
+        self._save_raw_packets = self.settings.value("save_raw_packets", False, type=bool)
 
         # 信号
         self.signals = PacketSignals()
@@ -378,6 +396,10 @@ class PacketCaptureApp(QMainWindow):
         save_button = QPushButton("💾 保存捕获")
         save_button.clicked.connect(self.save_capture)
         button_layout.addWidget(save_button)
+        
+        export_pcap_button = QPushButton("📥 导出为 PCAP")
+        export_pcap_button.clicked.connect(self.export_capture_pcap)
+        button_layout.addWidget(export_pcap_button)
         
         load_button = QPushButton("📂 加载捕获")
         load_button.clicked.connect(self.load_capture)
@@ -889,7 +911,7 @@ class PacketCaptureApp(QMainWindow):
     def _on_packet_captured(self, packet: object) -> None:
         """在捕获线程中调用"""
         try:
-            parsed = parse_packet(packet)
+            parsed = parse_packet(packet, extract_raw=getattr(self, "_save_raw_packets", False))
             self.signals.packet_captured.emit(parsed)
         except:
             logging.exception("解析数据包失败")
@@ -917,7 +939,12 @@ class PacketCaptureApp(QMainWindow):
             # 写入 JSONL（轮转式）
             try:
                 if self._jsonl_writer:
-                    payload = {"index": index, "data": packet.to_json()}
+                    data = packet.to_json()
+                    if not getattr(self, "_save_raw_packets", False):
+                        # 移除可能的原始字段以节省空间
+                        data.pop("raw_b64", None)
+                        data.pop("orig_ts", None)
+                    payload = {"index": index, "data": data}
                     self._jsonl_writer.write(payload)
             except:
                 logging.exception("写入 JSONL 失败")
@@ -1180,7 +1207,16 @@ class PacketCaptureApp(QMainWindow):
                 for _, pkt in sorted(self.captured_packets, key=lambda x: x[0]):
                     all_packets.append(pkt)
 
-            save_packets(Path(file_path), all_packets)
+            # 根据设置决定是否在导出 JSON 中包含 raw 字段
+            if not getattr(self, "_save_raw_packets", False):
+                # 生成仅包含非 raw 字段的字典列表
+                payload = [
+                    (lambda p: (lambda d: (d.pop("raw_b64", None), d.pop("orig_ts", None), d)[2])(p.to_json()))(p)
+                    for p in all_packets
+                ]
+                Path(file_path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            else:
+                save_packets(Path(file_path), all_packets)
             QMessageBox.information(self, "已保存", f"捕获数据已保存到 {file_path}")
         except Exception as exc:
             QMessageBox.critical(self, "保存错误", str(exc))
@@ -1210,6 +1246,34 @@ class PacketCaptureApp(QMainWindow):
 
         self._refresh_statistics()
         QMessageBox.information(self, "已加载", f"已加载 {len(packets)} 个数据包")
+
+    def export_capture_pcap(self) -> None:
+        """在 GUI 中导出当前捕获为 PCAP 文件（优先使用原始 bytes）。"""
+        has_any = bool(self.captured_packets) or (self._capture_jsonl_path and self._capture_jsonl_path.exists())
+        if not has_any:
+            QMessageBox.information(self, "无数据", "暂无数据包可导出。")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出为 PCAP", "", "PCAP Files (*.pcap)")
+        if not file_path:
+            return
+
+        try:
+            all_packets: List[ParsedPacket] = []
+            if self._capture_session_name:
+                captures_dir = Path.cwd() / "captures"
+                indexed_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
+                all_packets = [pkt for _, pkt in indexed_packets]
+            else:
+                for _, pkt in sorted(self.captured_packets, key=lambda x: x[0]):
+                    all_packets.append(pkt)
+
+            # 如果用户选择不保存 raw，那么内存中的 ParsedPacket 也不会包含 raw，export_to_pcap 会回退到字段重建
+            from .storage import export_to_pcap
+            export_to_pcap(Path(file_path), all_packets)
+            QMessageBox.information(self, "已导出", f"PCAP 已保存到 {file_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出错误", str(exc))
 
     # ------------------------------------------------------------------ 资源监控
     def _on_resource_sample(self, sample: ResourceSample) -> None:
