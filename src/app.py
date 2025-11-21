@@ -695,7 +695,7 @@ class PacketCaptureApp(QMainWindow):
             <p style='font-size: 14px; color: #666;'>🐱🦈 A network packet capture and analysis tool inspired by Wireshark</p>
             <hr style='border: 1px solid #ddd; margin: 15px 0;'>
             
-            <p><b>版本:</b> 1.0.0</p>
+            <p><b>版本:</b> 1.0.3</p>
             
             <p><b>制作人:</b>2组 Dual-Core：蔡兆元 王思哲</p>
             
