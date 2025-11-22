@@ -16,6 +16,7 @@ class TrafficStats:
         self._protocol_counts: Counter[str] = Counter()
         self._timeline: Deque[Tuple[datetime, int, int]] = deque()
         self.total_packets = 0
+        self._trim_counter = 0  # 用于控制trim频率
 
     def reset(self) -> None:
         self._protocol_counts.clear()
@@ -45,7 +46,11 @@ class TrafficStats:
         else:
             self._timeline.append((timestamp, 1, ipv6_present))
 
-        self._trim()
+        # 降低trim频率,每100个包才清理一次过期数据
+        self._trim_counter += 1
+        if self._trim_counter >= 100:
+            self._trim()
+            self._trim_counter = 0
 
     def _trim(self) -> None:
         cutoff = datetime.now() - self.window

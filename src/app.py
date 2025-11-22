@@ -254,7 +254,11 @@ class PacketCaptureApp(QMainWindow):
         self.packet_queue: "queue.Queue[ParsedPacket]" = queue.Queue()
         self.captured_packets: Deque[Tuple[int, ParsedPacket]] = deque(maxlen=self._ui_cache_size)
         self._packet_cache: Dict[int, ParsedPacket] = {}
+        self._packet_cache_max_size = self._ui_cache_size  # 限制缓存字典大小
         self._packet_global_index = 0
+        self._file_cache: Dict[str, List[Tuple[int, ParsedPacket]]] = {}  # 文件级别缓存
+        self._file_cache_max_files = 20  
+        self._file_cache_access_order: List[str] = []  # LRU访问顺序
         self._capture_session_name: Optional[str] = None
         self._jsonl_writer: Optional[RotatingJSONLWriter] = None
         self._resource_jsonl_writer: Optional[RotatingJSONLWriter] = None
@@ -304,16 +308,28 @@ class PacketCaptureApp(QMainWindow):
         self.network_check_timer.start(30000)  # 30秒
 
     def _populate_interfaces(self) -> None:
-        """填充网络接口列表"""
+        """填充网络接口列表，检测活跃接口"""
         self.interface_combo.clear()
         
         try:
             from scapy.all import get_if_list, IFACES, conf
+            import psutil
             
             # 添加"自动选择"选项
-            self.interface_combo.addItem("自动选择", None)
+            self.interface_combo.addItem("🔄 自动选择", None)
             
             interfaces = get_if_list()
+            
+            # 获取当前网络IO统计
+            net_io_start = psutil.net_io_counters(pernic=True)
+            
+            # 等待一小段时间收集数据
+            import time
+            time.sleep(0.3)
+            
+            # 再次获取网络IO统计
+            net_io_end = psutil.net_io_counters(pernic=True)
+            
             active_interfaces = []
             
             for iface in interfaces:
@@ -324,44 +340,80 @@ class PacketCaptureApp(QMainWindow):
                         description = getattr(iface_obj, 'description', '')
                         ip = getattr(iface_obj, 'ip', '')
                         
+                        # 跳过环回接口
+                        if 'loopback' in description.lower() or name.lower() in ['lo', 'loopback']:
+                            continue
+                        
+                        # 检测流量活动
+                        traffic_indicator = ""
+                        has_traffic = False
+                        packets_per_sec = 0
+                        
+                        if name in net_io_start and name in net_io_end:
+                            bytes_sent = net_io_end[name].bytes_sent - net_io_start[name].bytes_sent
+                            bytes_recv = net_io_end[name].bytes_recv - net_io_start[name].bytes_recv
+                            packets_sent = net_io_end[name].packets_sent - net_io_start[name].packets_sent
+                            packets_recv = net_io_end[name].packets_recv - net_io_start[name].packets_recv
+                            
+                            total_bytes = bytes_sent + bytes_recv
+                            total_packets = packets_sent + packets_recv
+                            packets_per_sec = total_packets / 0.3  # 0.3秒内的包数
+                            
+                            if total_bytes > 100:  # 有明显流量
+                                has_traffic = True
+                                if packets_per_sec > 10:
+                                    traffic_indicator = " 🔥 高流量"
+                                else:
+                                    traffic_indicator = " 📊 有流量"
+                        
                         # 构建显示文本
                         if ip and ip != '0.0.0.0':
-                            display_text = f"{name} ({ip})"
-                            # 有 IP 的接口优先
-                            active_interfaces.insert(0, (display_text, iface))
+                            display_text = f"{name} ({ip}){traffic_indicator}"
+                            # 优先级：有流量 > 有IP > 其他
+                            priority = 0 if has_traffic else 1
+                            active_interfaces.append((priority, packets_per_sec, display_text, iface))
                         elif description and 'loopback' not in description.lower():
-                            display_text = f"{name} - {description[:40]}"
-                            active_interfaces.append((display_text, iface))
+                            display_text = f"{name} - {description[:30]}{traffic_indicator}"
+                            priority = 2 if has_traffic else 3
+                            active_interfaces.append((priority, packets_per_sec, display_text, iface))
                         else:
-                            display_text = name
-                            active_interfaces.append((display_text, iface))
+                            display_text = f"{name}{traffic_indicator}"
+                            priority = 4
+                            active_interfaces.append((priority, packets_per_sec, display_text, iface))
                     else:
-                        active_interfaces.append((iface, iface))
-                except:
-                    active_interfaces.append((iface, iface))
+                        active_interfaces.append((5, 0, iface, iface))
+                except Exception as e:
+                    logging.debug(f"处理接口 {iface} 失败: {e}")
+                    continue
+            
+            # 按优先级和流量排序
+            active_interfaces.sort(key=lambda x: (x[0], -x[1]))
             
             # 添加所有接口
-            for display_text, iface_value in active_interfaces:
+            for _, _, display_text, iface_value in active_interfaces:
                 self.interface_combo.addItem(display_text, iface_value)
             
-            # 尝试选择默认的活动接口
-            # 优先选择有 IP 且不是 169.254 开头的接口
+            # 尝试恢复上次选择的网络接口
+            last_interface = self.settings.value("last_interface", "", type=str)
             default_selected = False
-            for i in range(1, self.interface_combo.count()):
-                iface_text = self.interface_combo.itemText(i)
-                if '(' in iface_text and ')' in iface_text:
-                    ip_part = iface_text.split('(')[1].split(')')[0]
-                    if not ip_part.startswith('169.254') and not ip_part.startswith('127.'):
+            
+            if last_interface:
+                for i in range(self.interface_combo.count()):
+                    if last_interface in self.interface_combo.itemText(i):
                         self.interface_combo.setCurrentIndex(i)
                         default_selected = True
                         break
             
+            # 如果没有保存的接口或找不到,自动选择有流量的接口
             if not default_selected and self.interface_combo.count() > 1:
-                self.interface_combo.setCurrentIndex(1)  # 选择第一个非"自动"的接口
+                # 优先选择第一个接口(已经按流量排序)
+                self.interface_combo.setCurrentIndex(1)  # 索引1是第一个真实接口
                 
         except Exception as e:
             logging.error(f"获取网络接口列表失败: {e}")
-            self.interface_combo.addItem("自动选择", None)
+            # 如果出错且列表为空,添加默认选项
+            if self.interface_combo.count() == 0:
+                self.interface_combo.addItem("🔄 自动选择", None)
 
     def _build_ui(self) -> None:
         """构建UI"""
@@ -387,6 +439,9 @@ class PacketCaptureApp(QMainWindow):
         filter_layout.addWidget(QLabel("BPF 过滤器:"))
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("例如: tcp port 80")
+        # 加载上次使用的BPF过滤器
+        last_bpf_filter = self.settings.value("last_bpf_filter", "", type=str)
+        self.filter_input.setText(last_bpf_filter)
         filter_layout.addWidget(self.filter_input)
         
         # 按钮
@@ -446,6 +501,9 @@ class PacketCaptureApp(QMainWindow):
         display_filter_layout.addWidget(QLabel("显示过滤器:"))
         self.display_filter_input = QLineEdit()
         self.display_filter_input.setPlaceholderText(r"正则表达式，例如: 192\.168\..*|tcp.*80")
+        # 加载上次使用的显示过滤器
+        last_display_filter = self.settings.value("last_display_filter", "", type=str)
+        self.display_filter_input.setText(last_display_filter)
         self.display_filter_input.textChanged.connect(self._on_display_filter_changed)
         display_filter_layout.addWidget(self.display_filter_input)
         
@@ -462,25 +520,25 @@ class PacketCaptureApp(QMainWindow):
         
         # 按钮行2
         button_layout = QHBoxLayout()
-        save_button = QPushButton("💾 保存捕获")
-        save_button.clicked.connect(self.save_capture)
-        button_layout.addWidget(save_button)
+        self.save_button = QPushButton("💾 保存捕获")
+        self.save_button.clicked.connect(self.save_capture)
+        button_layout.addWidget(self.save_button)
         
-        export_pcap_button = QPushButton("📥 导出为 PCAP")
-        export_pcap_button.clicked.connect(self.export_capture_pcap)
-        button_layout.addWidget(export_pcap_button)
+        self.export_pcap_button = QPushButton("📥 导出为 PCAP")
+        self.export_pcap_button.clicked.connect(self.export_capture_pcap)
+        button_layout.addWidget(self.export_pcap_button)
         
-        load_button = QPushButton("📂 加载捕获")
-        load_button.clicked.connect(self.load_capture)
-        button_layout.addWidget(load_button)
+        self.load_button = QPushButton("📂 加载捕获")
+        self.load_button.clicked.connect(self.load_capture)
+        button_layout.addWidget(self.load_button)
         
-        settings_button = QPushButton("⚙️ 设置")
-        settings_button.clicked.connect(self.open_settings)
-        button_layout.addWidget(settings_button)
+        self.settings_button = QPushButton("⚙️ 设置")
+        self.settings_button.clicked.connect(self.open_settings)
+        button_layout.addWidget(self.settings_button)
         
-        about_button = QPushButton("ℹ️ 关于")
-        about_button.clicked.connect(self.show_about)
-        button_layout.addWidget(about_button)
+        self.about_button = QPushButton("ℹ️ 关于")
+        self.about_button.clicked.connect(self.show_about)
+        button_layout.addWidget(self.about_button)
         
         # 网络状态指示器
         self.network_status_label = QLabel("● 未开始")
@@ -501,27 +559,13 @@ class PacketCaptureApp(QMainWindow):
         main_layout.addWidget(control_frame)
 
         # 主分割器
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: #555;
-                width: 2px;
-            }
-            QSplitter::handle:hover {
-                background-color: #777;
-            }
-        """)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Splitter 样式将在 _apply_theme 中设置
         
         # 左侧：数据包列表
-        left_widget = QWidget()
-        left_widget.setStyleSheet("""
-            QWidget {
-                border: 1px solid #444;
-                border-radius: 4px;
-                background-color: palette(window);
-            }
-        """)
-        left_layout = QVBoxLayout(left_widget)
+        self.left_widget = QWidget()
+        # 左侧面板样式将在 _apply_theme 中设置
+        left_layout = QVBoxLayout(self.left_widget)
         left_layout.setContentsMargins(8, 8, 8, 8)
         
         left_layout.addWidget(QLabel("📦 捕获的数据包"))
@@ -550,23 +594,28 @@ class PacketCaptureApp(QMainWindow):
         # 分页控件
         pagination_layout = QHBoxLayout()
         pagination_layout.addWidget(QLabel("每页记录:"))
-        self.page_size_input = QLineEdit("100")
+        # 加载上次使用的页面大小
+        last_page_size = self.settings.value("last_page_size", 100, type=int)
+        self.page_size_input = QLineEdit(str(last_page_size))
         self.page_size_input.setMaximumWidth(60)
         pagination_layout.addWidget(self.page_size_input)
         
         self.prev_button = QPushButton("◀ 上一页")
         self.prev_button.setMinimumWidth(80)
         self.prev_button.clicked.connect(self._on_prev_page)
+        # 样式将在 _apply_theme 中设置
         pagination_layout.addWidget(self.prev_button)
         
         self.load_page_button = QPushButton("🔄 回到最新")
         self.load_page_button.setMinimumWidth(100)
         self.load_page_button.clicked.connect(self._on_load_page)
+        # 样式将在 _apply_theme 中设置
         pagination_layout.addWidget(self.load_page_button)
         
         self.next_button = QPushButton("下一页 ▶")
         self.next_button.setMinimumWidth(80)
         self.next_button.clicked.connect(self._on_next_page)
+        # 样式将在 _apply_theme 中设置
         pagination_layout.addWidget(self.next_button)
         
         self.page_label = QLabel("记录: -")
@@ -577,29 +626,7 @@ class PacketCaptureApp(QMainWindow):
         
         # 右侧：标签页
         self.tab_widget = QTabWidget()
-        self.tab_widget.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #444;
-                border-radius: 4px;
-                background-color: palette(window);
-                padding: 4px;
-            }
-            QTabBar::tab {
-                background-color: #353535;
-                color: white;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background-color: #505050;
-                border-bottom: 2px solid #4a9eff;
-            }
-            QTabBar::tab:hover {
-                background-color: #454545;
-            }
-        """)
+        # TabWidget 样式将在 _apply_theme 中设置
         
         # 详情标签页
         self.details_tree = QTreeWidget()
@@ -657,11 +684,11 @@ class PacketCaptureApp(QMainWindow):
         self.tab_widget.addTab(resource_widget, "💻 资源监控")
         
         # 添加到分割器
-        splitter.addWidget(left_widget)
-        splitter.addWidget(self.tab_widget)
-        splitter.setSizes([600, 800])
+        self.splitter.addWidget(self.left_widget)
+        self.splitter.addWidget(self.tab_widget)
+        self.splitter.setSizes([600, 800])
         
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.splitter)
 
     def open_settings(self):
         """打开设置对话框"""
@@ -678,9 +705,15 @@ class PacketCaptureApp(QMainWindow):
             # 如果缓存大小改变，需要重新创建 deque
             if new_settings["cache_size"] != self._ui_cache_size:
                 self._ui_cache_size = new_settings["cache_size"]
+                self._packet_cache_max_size = self._ui_cache_size  # 同步更新缓存字典大小限制
                 # 保留现有数据，只改变最大长度
                 old_packets = list(self.captured_packets)
                 self.captured_packets = deque(old_packets, maxlen=self._ui_cache_size)
+                # 清理超出新限制的缓存
+                if len(self._packet_cache) > self._packet_cache_max_size:
+                    sorted_keys = sorted(self._packet_cache.keys())
+                    for key in sorted_keys[:-self._packet_cache_max_size]:
+                        del self._packet_cache[key]
             
             # 应用主题设置
             self._apply_theme(new_settings["theme"])
@@ -695,7 +728,7 @@ class PacketCaptureApp(QMainWindow):
             <p style='font-size: 14px; color: #666;'>🐱🦈 A network packet capture and analysis tool inspired by Wireshark</p>
             <hr style='border: 1px solid #ddd; margin: 15px 0;'>
             
-            <p><b>版本:</b> 1.0.3</p>
+            <p><b>版本:</b> 1.0.5</p>
             
             <p><b>制作人:</b>2组 Dual-Core：蔡兆元 王思哲</p>
             
@@ -741,6 +774,8 @@ class PacketCaptureApp(QMainWindow):
             self._display_filter_enabled = True
             self.filter_status_label.setText("✓ 过滤器有效")
             self.filter_status_label.setStyleSheet("color: green; font-size: 11px;")
+            # 保存显示过滤器设置
+            self.settings.setValue("last_display_filter", text)
             self._on_load_page()  # 重新加载页面
         except re.error as e:
             self._display_filter_pattern = None
@@ -781,6 +816,16 @@ class PacketCaptureApp(QMainWindow):
             palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
             palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
             palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+            
+            # 设置 matplotlib 暗色主题
+            matplotlib.rcParams['figure.facecolor'] = '#353535'
+            matplotlib.rcParams['axes.facecolor'] = '#2d2d2d'
+            matplotlib.rcParams['axes.edgecolor'] = '#666666'
+            matplotlib.rcParams['axes.labelcolor'] = 'white'
+            matplotlib.rcParams['text.color'] = 'white'
+            matplotlib.rcParams['xtick.color'] = 'white'
+            matplotlib.rcParams['ytick.color'] = 'white'
+            matplotlib.rcParams['grid.color'] = '#555555'
         else:
             # 明色主题 (系统默认)
             palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
@@ -796,45 +841,266 @@ class PacketCaptureApp(QMainWindow):
             palette.setColor(QPalette.ColorRole.Link, QColor(0, 0, 255))
             palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
             palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+            
+            # 设置 matplotlib 明色主题
+            matplotlib.rcParams['figure.facecolor'] = 'white'
+            matplotlib.rcParams['axes.facecolor'] = 'white'
+            matplotlib.rcParams['axes.edgecolor'] = 'black'
+            matplotlib.rcParams['axes.labelcolor'] = 'black'
+            matplotlib.rcParams['text.color'] = 'black'
+            matplotlib.rcParams['xtick.color'] = 'black'
+            matplotlib.rcParams['ytick.color'] = 'black'
+            matplotlib.rcParams['grid.color'] = '#cccccc'
         
         QApplication.instance().setPalette(palette)
-
-    def _apply_theme(self, theme: str):
-        """应用明色或暗色主题"""
-        palette = QPalette()
         
+        # 应用组件样式
         if theme == "dark":
-            # 暗色主题
-            palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-            palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
-            palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(25, 25, 25))
-            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
-            palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
-            palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-            palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
-            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-            palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-            palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+            # TabWidget 暗色样式
+            self.tab_widget.setStyleSheet("""
+                QTabWidget::pane {
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                    background-color: #353535;
+                    padding: 4px;
+                }
+                QTabBar::tab {
+                    background-color: #353535;
+                    color: white;
+                    padding: 8px 16px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                }
+                QTabBar::tab:selected {
+                    background-color: #505050;
+                    border-bottom: 2px solid #4a9eff;
+                }
+                QTabBar::tab:hover {
+                    background-color: #454545;
+                }
+            """)
+            
+            # Splitter 暗色样式
+            self.splitter.setStyleSheet("""
+                QSplitter::handle {
+                    background-color: #555;
+                    width: 2px;
+                }
+                QSplitter::handle:hover {
+                    background-color: #777;
+                }
+            """)
+            
+            # 左侧面板暗色样式
+            self.left_widget.setStyleSheet("""
+                QWidget {
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                    background-color: #353535;
+                }
+            """)
+            
+            # 通用按钮样式（保存、导入、设置、关于等）
+            button_style = """
+                QPushButton {
+                    background-color: #4a4a4a;
+                    color: white;
+                    border: 1px solid #666;
+                    border-radius: 4px;
+                    padding: 6px 12px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #5a5a5a;
+                    border: 1px solid #777;
+                }
+                QPushButton:pressed {
+                    background-color: #3a3a3a;
+                }
+            """
         else:
-            # 明色主题 (系统默认)
-            palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
-            palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
-            palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(245, 245, 245))
-            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 220))
-            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
-            palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
-            palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
-            palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
-            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-            palette.setColor(QPalette.ColorRole.Link, QColor(0, 0, 255))
-            palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
-            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+            # TabWidget 明色样式
+            self.tab_widget.setStyleSheet("""
+                QTabWidget::pane {
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    background-color: #f5f5f5;
+                    padding: 4px;
+                }
+                QTabBar::tab {
+                    background-color: #e0e0e0;
+                    color: black;
+                    padding: 8px 16px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                }
+                QTabBar::tab:selected {
+                    background-color: white;
+                    border-bottom: 2px solid #0078d4;
+                }
+                QTabBar::tab:hover {
+                    background-color: #f0f0f0;
+                }
+            """)
+            
+            # Splitter 明色样式
+            self.splitter.setStyleSheet("""
+                QSplitter::handle {
+                    background-color: #ccc;
+                    width: 2px;
+                }
+                QSplitter::handle:hover {
+                    background-color: #999;
+                }
+            """)
+            
+            # 左侧面板明色样式
+            self.left_widget.setStyleSheet("""
+                QWidget {
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    background-color: white;
+                }
+            """)
+            
+            # 通用按钮样式（保存、导入、设置、关于等）- 明色主题
+            button_style = """
+                QPushButton {
+                    background-color: #0078d4;
+                    color: white;
+                    border: 1px solid #005a9e;
+                    border-radius: 4px;
+                    padding: 6px 12px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #106ebe;
+                    border: 1px solid #004578;
+                }
+                QPushButton:pressed {
+                    background-color: #005a9e;
+                }
+            """
         
-        QApplication.instance().setPalette(palette)
+        # 应用按钮样式到功能按钮
+        if hasattr(self, 'save_button'):
+            for btn in [self.save_button, self.load_button, self.export_pcap_button, 
+                       self.settings_button, self.about_button]:
+                btn.setStyleSheet(button_style)
+        
+        # 应用分页按钮样式
+        if hasattr(self, 'prev_button'):
+            if theme == "dark":
+                # 暗色主题分页按钮
+                nav_button_style = """
+                    QPushButton {
+                        background-color: #4a4a4a;
+                        color: white;
+                        border: 1px solid #666;
+                        border-radius: 4px;
+                        padding: 6px 12px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #5a9fd4;
+                        border: 1px solid #4a8fc7;
+                    }
+                    QPushButton:pressed {
+                        background-color: #3d7db3;
+                    }
+                    QPushButton:disabled {
+                        background-color: #333;
+                        color: #666;
+                    }
+                """
+                reload_button_style = """
+                    QPushButton {
+                        background-color: #2e7d32;
+                        color: white;
+                        border: 1px solid #1b5e20;
+                        border-radius: 4px;
+                        padding: 6px 12px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #388e3c;
+                        border: 1px solid #2e7d32;
+                    }
+                    QPushButton:pressed {
+                        background-color: #1b5e20;
+                    }
+                    QPushButton:disabled {
+                        background-color: #333;
+                        color: #666;
+                    }
+                """
+            else:
+                # 明色主题分页按钮
+                nav_button_style = """
+                    QPushButton {
+                        background-color: #f0f0f0;
+                        color: black;
+                        border: 1px solid #999;
+                        border-radius: 4px;
+                        padding: 6px 12px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #0078d4;
+                        color: white;
+                        border: 1px solid #005a9e;
+                    }
+                    QPushButton:pressed {
+                        background-color: #005a9e;
+                        color: white;
+                    }
+                    QPushButton:disabled {
+                        background-color: #e0e0e0;
+                        color: #999;
+                    }
+                """
+                reload_button_style = """
+                    QPushButton {
+                        background-color: #2e7d32;
+                        color: white;
+                        border: 1px solid #1b5e20;
+                        border-radius: 4px;
+                        padding: 6px 12px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #388e3c;
+                        border: 1px solid #2e7d32;
+                    }
+                    QPushButton:pressed {
+                        background-color: #1b5e20;
+                    }
+                    QPushButton:disabled {
+                        background-color: #ccc;
+                        color: #999;
+                    }
+                """
+            
+            self.prev_button.setStyleSheet(nav_button_style)
+            self.next_button.setStyleSheet(nav_button_style)
+            self.load_page_button.setStyleSheet(reload_button_style)
+        
+        # 更新现有图表的背景色
+        if hasattr(self, 'figure'):
+            bg_color = '#353535' if theme == "dark" else 'white'
+            self.figure.patch.set_facecolor(bg_color)
+            for ax in [self.ax_ipv6, self.ax_bar]:
+                ax.set_facecolor('#2d2d2d' if theme == "dark" else 'white')
+            self.canvas.draw()
+        
+        if hasattr(self, 'resource_figure'):
+            bg_color = '#353535' if theme == "dark" else 'white'
+            self.resource_figure.patch.set_facecolor(bg_color)
+            for ax in [self.ax_cpu, self.ax_memory]:
+                ax.set_facecolor('#2d2d2d' if theme == "dark" else 'white')
+            self.resource_canvas.draw()
 
 
     # ------------------------------------------------------------------ 分页逻辑
@@ -858,6 +1124,8 @@ class PacketCaptureApp(QMainWindow):
     def _on_load_page(self) -> None:
         try:
             self._page_size = max(1, int(self.page_size_input.text()))
+            # 保存页面大小设置
+            self.settings.setValue("last_page_size", self._page_size)
         except:
             self._page_size = 100
         
@@ -891,6 +1159,63 @@ class PacketCaptureApp(QMainWindow):
                 self._new_packets_since_page = 0
             self._load_page_by_index(start, end)
 
+    def _read_packets_with_cache(self, base_dir: Path, session_name: str, start_idx: int, end_idx: int) -> List[Tuple[int, ParsedPacket]]:
+        """从JSONL文件读取指定范围的数据包，使用文件级LRU缓存"""
+        results = []
+        
+        # 找到所有相关的JSONL文件
+        pattern = f"{session_name}_*.jsonl"
+        files = sorted(base_dir.glob(pattern))
+        
+        for file_path in files:
+            file_key = str(file_path)
+            
+            # 检查缓存
+            if file_key in self._file_cache:
+                # 更新LRU访问顺序
+                if file_key in self._file_cache_access_order:
+                    self._file_cache_access_order.remove(file_key)
+                self._file_cache_access_order.append(file_key)
+                
+                packets = self._file_cache[file_key]
+            else:
+                # 从磁盘读取文件
+                packets = []
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            if line.strip():
+                                data = json.loads(line)
+                                idx = data.get("index", -1)
+                                
+                                # 处理嵌套格式 {"index": x, "data": {...}}
+                                if "data" in data:
+                                    pkt_data = data["data"]
+                                else:
+                                    pkt_data = data
+                                
+                                pkt = ParsedPacket.from_json(pkt_data)
+                                packets.append((idx, pkt))
+                except Exception as e:
+                    logging.warning(f"读取文件失败 {file_path}: {e}")
+                    continue
+                
+                # 添加到缓存
+                self._file_cache[file_key] = packets
+                self._file_cache_access_order.append(file_key)
+                
+                # LRU淘汰
+                while len(self._file_cache) > self._file_cache_max_files:
+                    oldest_key = self._file_cache_access_order.pop(0)
+                    del self._file_cache[oldest_key]
+            
+            # 筛选需要的范围
+            for idx, pkt in packets:
+                if start_idx <= idx <= end_idx:
+                    results.append((idx, pkt))
+        
+        return results
+
     def _on_next_page(self) -> None:
         last_index = self._packet_global_index - 1
         if last_index < 0:
@@ -906,28 +1231,33 @@ class PacketCaptureApp(QMainWindow):
             self._load_page_by_index(start, end)
 
     def _load_page_by_index(self, start_idx: int, end_idx: int) -> None:
-        """按索引范围加载页面"""
+        """按索引范围加载页面 - 优化版本,避免UI卡顿"""
         # 检查是否在底部（用于自动滚动）
         scrollbar = self.packet_table.verticalScrollBar()
-        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10  # 留10像素容差
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
         
         results = []
-
+        
+        # 策略: 优先从内存读取,只在必要时从磁盘读取
         try:
-            if self._capture_session_name:
-                # 从所有轮转文件中读取指定范围的数据包
+            # Step 1: 从内存缓存读取(最快)
+            memory_indices = set()
+            for idx, pkt in self.captured_packets:
+                if start_idx <= idx <= end_idx:
+                    results.append((idx, pkt))
+                    memory_indices.add(idx)
+            
+            # Step 2: 如果内存不全,且有session,从磁盘读取
+            needed_count = end_idx - start_idx + 1
+            if len(results) < needed_count and self._capture_session_name:
                 captures_dir = Path.cwd() / "captures"
-                all_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
-                for idx, pkt in all_packets:
-                    if start_idx <= idx <= end_idx:
+                # 使用缓存读取,只读需要的范围
+                disk_packets = self._read_packets_with_cache(captures_dir, self._capture_session_name, start_idx, end_idx)
+                for idx, pkt in disk_packets:
+                    if idx not in memory_indices:
                         results.append((idx, pkt))
-            else:
-                # 从内存缓存读取
-                for idx, pkt in self.captured_packets:
-                    if start_idx <= idx <= end_idx:
-                        results.append((idx, pkt))
-        except:
-            logging.exception("按索引加载页面失败")
+        except Exception as e:
+            logging.exception("加载页面失败")
 
         results.sort(key=lambda x: x[0])
         
@@ -1022,12 +1352,13 @@ class PacketCaptureApp(QMainWindow):
             self._stats_update_counter += 1
             batch_count += 1
 
-            # 内存缓存管理
+            # 内存缓存管理 - 清理旧数据防止无限增长
             try:
-                if self.captured_packets.maxlen and len(self.captured_packets) >= self.captured_packets.maxlen:
-                    oldest_index, _ = self.captured_packets.popleft()
-                    if oldest_index in self._packet_cache:
-                        del self._packet_cache[oldest_index]
+                # 当缓存满时,删除最旧的条目
+                if len(self._packet_cache) >= self._packet_cache_max_size:
+                    # 删除最小的index(最旧的数据)
+                    min_index = min(self._packet_cache.keys())
+                    del self._packet_cache[min_index]
             except:
                 pass
 
@@ -1121,10 +1452,10 @@ class PacketCaptureApp(QMainWindow):
 
         try:
             if self._capture_session_name:
-                # 从所有轮转文件中查找
+                # 从缓存的文件中查找
                 captures_dir = Path.cwd() / "captures"
-                all_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
-                for idx, pkt in all_packets:
+                packets = self._read_packets_with_cache(captures_dir, self._capture_session_name, index, index)
+                for idx, pkt in packets:
                     if idx == index:
                         return pkt
         except:
@@ -1139,8 +1470,17 @@ class PacketCaptureApp(QMainWindow):
 
         filter_expr = self.filter_input.text().strip() or None
         
+        # 保存BPF过滤器设置
+        if filter_expr:
+            self.settings.setValue("last_bpf_filter", filter_expr)
+        
         # 获取选择的网络接口
         selected_iface = self.interface_combo.currentData()
+        
+        # 保存网络接口设置
+        if self.interface_combo.currentIndex() >= 0:
+            self.settings.setValue("last_interface", self.interface_combo.currentText())
+        
         if selected_iface is None:
             # "自动选择"
             iface = None
@@ -1219,6 +1559,23 @@ class PacketCaptureApp(QMainWindow):
         finally:
             self._capture_jsonl_file = None
             self._capture_jsonl_path = None
+        
+        # 清理内存 - 只保留最近的数据
+        try:
+            # 将resource_samples限制为最后50个
+            if len(self.resource_samples) > 50:
+                self.resource_samples = self.resource_samples[-50:]
+            # 清空packet队列
+            while not self.packet_queue.empty():
+                try:
+                    self.packet_queue.get_nowait()
+                except:
+                    break
+            # 清理文件缓存
+            self._file_cache.clear()
+            self._file_cache_access_order.clear()
+        except:
+            pass
 
     # ------------------------------------------------------------------ 统计
     def _refresh_statistics(self) -> None:
@@ -1263,7 +1620,7 @@ class PacketCaptureApp(QMainWindow):
 
     # ------------------------------------------------------------------ 持久化
     def save_capture(self) -> None:
-        has_any = bool(self.captured_packets) or (self._capture_jsonl_path and self._capture_jsonl_path.exists())
+        has_any = bool(self.captured_packets) or (hasattr(self, '_capture_jsonl_path') and self._capture_jsonl_path and self._capture_jsonl_path.exists())
         if not has_any:
             QMessageBox.information(self, "无数据", "暂无数据包可保存。")
             return
@@ -1342,7 +1699,7 @@ class PacketCaptureApp(QMainWindow):
 
     def export_capture_pcap(self) -> None:
         """在 GUI 中导出当前捕获为 PCAP 文件（优先使用原始 bytes）。"""
-        has_any = bool(self.captured_packets) or (self._capture_jsonl_path and self._capture_jsonl_path.exists())
+        has_any = bool(self.captured_packets) or (hasattr(self, '_capture_jsonl_path') and self._capture_jsonl_path and self._capture_jsonl_path.exists())
         if not has_any:
             QMessageBox.information(self, "无数据", "暂无数据包可导出。")
             return
@@ -1387,11 +1744,13 @@ class PacketCaptureApp(QMainWindow):
         
         # 保持最近 200 条在内存中（用于图表显示）
         self.resource_samples.append(sample)
+        # 使用更高效的切片删除,而不是逐个pop
         if len(self.resource_samples) > 200:
-            self.resource_samples.pop(0)
+            self.resource_samples = self.resource_samples[-200:]
         
-        # 更新资源图表
-        self._update_resource_charts()
+        # 降低图表更新频率 - 每10个样本更新一次(20秒)
+        if len(self.resource_samples) % 10 == 0:
+            self._update_resource_charts()
 
     def export_resource_log(self) -> None:
         if not self._capture_session_name:
